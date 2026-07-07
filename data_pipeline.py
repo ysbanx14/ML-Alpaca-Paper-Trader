@@ -1,10 +1,9 @@
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
 from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import DataFeed, Adjustment
 from datetime import datetime
 
 class DataPipeline:
@@ -22,7 +21,8 @@ class DataPipeline:
             timeframe=TimeFrame.Day,
             start=start_date,
             end=end_date,
-            feed=DataFeed.IEX
+            feed=DataFeed.IEX,
+            adjustment=Adjustment.ALL
         )
         
         bars = self.client.get_stock_bars(request_params)
@@ -32,45 +32,46 @@ class DataPipeline:
         if isinstance(df.index, pd.MultiIndex):
             df = df.reset_index(level=0, drop=True)
             
-        # Ensure timestamp is timezone-naive or properly handled for pandas_ta
+        # Ensure timestamp is timezone-naive
         df.index = df.index.tz_convert(None)
         
         return df
 
     def engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Applies technical indicators using pandas_ta and manual calculations."""
+        """Applies technical indicators using pure native pandas math."""
         if df is None or df.empty:
             return df
             
         df = df.copy()
         
         # 1. Trend: SMA (50-day)
-        df['SMA_50'] = ta.sma(df['close'], length=50)
+        df['SMA_50'] = df['close'].rolling(window=50).mean()
         
         # 2. Trend: MACD
-        macd = ta.macd(df['close'])
-        # macd returns multiple columns: MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
-        if macd is not None and not macd.empty:
-            df = pd.concat([df, macd.iloc[:, 0].rename('MACD')], axis=1)
-        else:
-            df['MACD'] = np.nan
+        ema_12 = df['close'].ewm(span=12, adjust=False).mean()
+        ema_26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = ema_12 - ema_26
             
         # 3. Momentum: RSI (14-day)
-        df['RSI_14'] = ta.rsi(df['close'], length=14)
+        delta = df['close'].diff()
+        gain = np.where(delta > 0, delta, 0)
+        loss = np.where(delta < 0, -delta, 0)
+        
+        avg_gain = pd.Series(gain, index=df.index).rolling(window=14).mean()
+        avg_loss = pd.Series(loss, index=df.index).rolling(window=14).mean()
+        rs = avg_gain / avg_loss
+        df['RSI_14'] = 100 - (100 / (1 + rs))
         
         # 4. Volatility: Bollinger Bands
-        bb = ta.bbands(df['close'], length=20, std=2)
-        if bb is not None and not bb.empty:
-            # Typically returns BBL_20_2.0, BBM_20_2.0, BBU_20_2.0, BBB_20_2.0, BBP_20_2.0
-            # Let's extract Upper and Lower bands
-            df['BB_Lower'] = bb.iloc[:, 0]
-            df['BB_Upper'] = bb.iloc[:, 2]
-        else:
-            df['BB_Lower'] = np.nan
-            df['BB_Upper'] = np.nan
+        sma_20 = df['close'].rolling(window=20).mean()
+        std_20 = df['close'].rolling(window=20).std()
+        df['BB_Upper'] = sma_20 + (std_20 * 2)
+        df['BB_Lower'] = sma_20 - (std_20 * 2)
             
         # 5. Volume: OBV
-        df['OBV'] = ta.obv(df['close'], df['volume'])
+        direction = np.sign(df['close'].diff())
+        direction = direction.fillna(1) # Handle the first row NaN
+        df['OBV'] = (direction * df['volume']).cumsum()
         
         # 6. Additional: Log Returns, 20-day Rolling Mean, 20-day Rolling Std
         df['Log_Return'] = np.log(df['close'] / df['close'].shift(1))
@@ -78,17 +79,19 @@ class DataPipeline:
         df['Roll_Std_20'] = df['close'].rolling(window=20).std()
         
         # Target Variable: 1 if next day's return > 0, else 0
-        df['Next_Day_Return'] = df['close'].pct_change().shift(-1)
-        df['Target'] = (df['Next_Day_Return'] > 0).astype(int)
+        df['Target'] = (df['close'].shift(-1) > df['close']).astype(int)
         
-        # Clean Data (Drop NaNs resulting from indicator lookbacks and shifting)
+        # Clean Data (Drop NaNs resulting from indicator lookbacks)
         df = df.dropna()
+        
+        # Explicitly drop the last row since its "future" target cannot be known
+        df = df.iloc[:-1]
         
         return df
 
     def get_latest_data_for_prediction(self, symbol: str) -> pd.DataFrame:
         """Fetches just enough historical data to generate today's signal."""
-        # Need at least 50 days for SMA_50, let's fetch 100 days to be safe
+        # Need at least 50 days for SMA_50, let's fetch 150 days to be safe
         end_date = datetime.now()
         start_date = end_date - pd.Timedelta(days=150)
         
@@ -97,7 +100,8 @@ class DataPipeline:
             timeframe=TimeFrame.Day,
             start=start_date,
             end=end_date,
-            feed=DataFeed.IEX
+            feed=DataFeed.IEX,
+            adjustment=Adjustment.ALL
         )
         
         bars = self.client.get_stock_bars(request_params)
@@ -114,29 +118,39 @@ class DataPipeline:
         return df_featured
 
     def engineer_features_predict(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Similar to engineer_features, but does NOT drop the last row due to unknown future."""
+        """Similar to engineer_features, but does NOT drop the last row."""
         if df is None or df.empty:
             return df
             
         df = df.copy()
-        df['SMA_50'] = ta.sma(df['close'], length=50)
-        macd = ta.macd(df['close'])
-        df['MACD'] = macd.iloc[:, 0] if macd is not None and not macd.empty else np.nan
-        df['RSI_14'] = ta.rsi(df['close'], length=14)
-        bb = ta.bbands(df['close'], length=20, std=2)
         
-        if bb is not None and not bb.empty:
-            df['BB_Lower'] = bb.iloc[:, 0]
-            df['BB_Upper'] = bb.iloc[:, 2]
-        else:
-            df['BB_Lower'] = np.nan
-            df['BB_Upper'] = np.nan
+        df['SMA_50'] = df['close'].rolling(window=50).mean()
+        
+        ema_12 = df['close'].ewm(span=12, adjust=False).mean()
+        ema_26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = ema_12 - ema_26
             
-        df['OBV'] = ta.obv(df['close'], df['volume'])
+        delta = df['close'].diff()
+        gain = np.where(delta > 0, delta, 0)
+        loss = np.where(delta < 0, -delta, 0)
+        avg_gain = pd.Series(gain, index=df.index).rolling(window=14).mean()
+        avg_loss = pd.Series(loss, index=df.index).rolling(window=14).mean()
+        rs = avg_gain / avg_loss
+        df['RSI_14'] = 100 - (100 / (1 + rs))
+        
+        sma_20 = df['close'].rolling(window=20).mean()
+        std_20 = df['close'].rolling(window=20).std()
+        df['BB_Upper'] = sma_20 + (std_20 * 2)
+        df['BB_Lower'] = sma_20 - (std_20 * 2)
+            
+        direction = np.sign(df['close'].diff()).fillna(1)
+        df['OBV'] = (direction * df['volume']).cumsum()
+        
         df['Log_Return'] = np.log(df['close'] / df['close'].shift(1))
         df['Roll_Mean_20'] = df['close'].rolling(window=20).mean()
         df['Roll_Std_20'] = df['close'].rolling(window=20).std()
         
-        # No Next_Day_Return or Target computed here
+        # No Target computed here.
         df = df.dropna()
+        
         return df

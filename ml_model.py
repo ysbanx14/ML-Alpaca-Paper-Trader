@@ -2,14 +2,22 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import GradientBoostingClassifier
 
 class MLModelPipeline:
     def __init__(self):
         self.scaler = StandardScaler()
         # Initialize PCA without fixed n_components. We'll set it during fit.
         self.pca = PCA()
-        self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+        self.model = GradientBoostingClassifier(
+            n_estimators=150,
+            max_depth=4,
+            min_samples_leaf=2,
+            learning_rate=0.1,
+            subsample=0.9,
+            max_features='sqrt',
+            random_state=42
+        )
         
         self.n_components_kept = 0
         self.explained_variance_ratio_ = None
