@@ -15,11 +15,12 @@ class PaperTrader:
             paper=True
         )
 
-    def execute_trade(self, symbol: str, signal: int):
+    def execute_trade(self, symbol: str, signal: int, active_models: int = 1):
         """
         Executes a paper trade based on the given signal.
         signal == 1: Long (Market Buy)
         signal == 0: Flat (Liquidate position)
+        active_models: The number of active ticker models deployed in the portfolio.
         """
         try:
             # Check current position
@@ -32,11 +33,11 @@ class PaperTrader:
                     # Not in position, so we buy
                     account = self.trading_client.get_account()
                     
-                    # We will use 95% of available buying power for this trade to avoid margin issues
-                    buying_power = float(account.buying_power)
-                    trade_amount = buying_power * 0.95
-                    
-                    if trade_amount > 10:  # Minimum threshold for a trade
+                    # Calculate exactly 1% of total equity
+                    account_equity = float(account.equity)
+                    trade_amount = account_equity * 0.01
+
+                    if trade_amount >= 10:  # Minimum threshold for a trade
                         try:
                             # Try notional (fractional) buying first
                             market_order_data = MarketOrderRequest(
@@ -136,3 +137,22 @@ class PaperTrader:
             return logs
         except Exception as e:
             return []
+
+    def get_portfolio_capital(self) -> dict:
+        """
+        Dynamically calculates the true total equity and currently allocated capital 
+        across all open positions directly from the Alpaca API.
+        """
+        try:
+            account = self.trading_client.get_account()
+            positions = self.trading_client.get_all_positions()
+            
+            total_equity = float(account.equity)
+            allocated_capital = sum(float(pos.market_value) for pos in positions)
+            
+            return {
+                "total_equity": total_equity,
+                "allocated_capital": allocated_capital
+            }
+        except Exception as e:
+            return {"total_equity": 100000.0, "allocated_capital": 0.0}

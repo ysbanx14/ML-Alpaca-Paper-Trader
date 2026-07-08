@@ -3,6 +3,8 @@ import traceback
 from dotenv import load_dotenv
 
 import streamlit as st
+import time
+from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
@@ -84,40 +86,85 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.header("Deployed Models")
 tracked = pm.get_tracked_tickers()
+active_models = len(tracked)
+max_models = 5
+budget_per_model = 20000.0
+
+st.sidebar.markdown(f"**Portfolio Capacity: {active_models} / {max_models} Models**")
+
+if api_key and secret_key:
+    pt_ui = PaperTrader(api_key, secret_key)
+    portfolio_data = pt_ui.get_portfolio_capital()
+    allocated_capital = portfolio_data["allocated_capital"]
+    total_equity = portfolio_data["total_equity"]
+    
+    ratio = min(allocated_capital / max(1.0, total_equity), 1.0)
+    st.sidebar.progress(ratio)
+    st.sidebar.caption(f"Allocated: ${allocated_capital:,.2f} / ${total_equity:,.2f}")
+else:
+    if active_models > 0:
+        st.sidebar.progress(min(active_models / max_models, 1.0))
+    st.sidebar.caption("API Keys required to fetch allocation data.")
+
+if active_models >= max_models:
+    st.sidebar.error("⚠️ Maximum model count reached! Liquidate an active model to deploy a new one.")
+
 if tracked:
-    st.sidebar.write(", ".join(tracked))
+    st.sidebar.write("**Tracked:** " + ", ".join(tracked))
 else:
     st.sidebar.write("No models deployed yet.")
 
-if st.sidebar.button("⚡ Execute Daily Trades"):
+st.sidebar.markdown("---")
+st.sidebar.header("Mass Deploy")
+st.sidebar.write("Deploy strategy to top liquid assets instantly:")
+if st.sidebar.button("🚀 Deploy to Top 50 Liquid Stocks"):
+    top_50 = ["AAPL", "NVDA", "TSLA", "AMD", "MSFT", "META", "GOOGL", "AMZN", "NFLX", "SPY", "QQQ", "BA", "DIS", "JPM", "V", "MA", "WMT", "JNJ", "PG", "HD", "UNH", "XOM", "CVX", "ABBV", "PFE", "KO", "PEP", "MRK", "TMO", "COST", "CSCO", "MCD", "NKE", "CRM", "ADBE", "TXN", "AVGO", "QCOM", "INTC", "IBM", "HON", "AMGN", "CAT", "GE", "MMM", "GS", "MS", "BLK", "UBER"]
+    added_count = 0
+    for t_mass in top_50:
+        if pm.add_ticker(t_mass):
+            added_count += 1
+    st.sidebar.success(f"Successfully deployed {added_count} new tickers to the Live Portfolio!")
+def run_portfolio_execution():
     if not api_key or not secret_key:
         st.sidebar.error("API Keys missing.")
-    elif not tracked:
+        return
+    if not tracked:
         st.sidebar.warning("No tickers deployed.")
-    else:
-        with st.spinner("Executing daily trades for all deployed models..."):
-            dp = DataPipeline(api_key, secret_key)
-            ml = MLModelPipeline()
-            pt = PaperTrader(api_key, secret_key)
-            for t in tracked:
-                try:
-                    df = dp.fetch_data(t, years=5)
-                    if df.empty:
-                        st.sidebar.error(f"No data for {t}")
-                        continue
-                    df_features = dp.engineer_features(df)
-                    split_idx = int(len(df_features) * 0.8)
-                    train_df = df_features.iloc[:split_idx]
-                    ml.train(train_df)
-                    
-                    latest_df = dp.get_latest_data_for_prediction(t)
-                    if not latest_df.empty:
-                        today_signal, _ = ml.predict_today_signal(latest_df)
-                        res = pt.execute_trade(t, today_signal)
-                        st.sidebar.info(f"{t}: {res}")
-                except Exception as e:
-                    st.sidebar.error(f"Failed to trade {t}: {e}")
+        return
+    with st.spinner("Executing daily trades for all deployed models..."):
+        dp = DataPipeline(api_key, secret_key)
+        ml = MLModelPipeline()
+        pt = PaperTrader(api_key, secret_key)
+        for t in tracked:
+            try:
+                time.sleep(0.5)  # Rate Limit Protection
+                df = dp.fetch_data(t, years=5)
+                if df.empty:
+                    st.sidebar.error(f"No data for {t}")
+                    continue
+                df_features = dp.engineer_features(df)
+                split_idx = int(len(df_features) * 0.8)
+                train_df = df_features.iloc[:split_idx]
+                ml.train(train_df)
+                
+                latest_df = dp.get_latest_data_for_prediction(t)
+                if not latest_df.empty:
+                    today_signal, _ = ml.predict_today_signal(latest_df)
+                    res = pt.execute_trade(t, today_signal, active_models=active_models)
+                    st.sidebar.info(f"{t}: {res}")
+            except Exception as e:
+                st.sidebar.error(f"Failed to trade {t}: {e}")
         st.sidebar.success("Daily Execution Complete!")
+
+st.sidebar.markdown("---")
+st.sidebar.header("🤖 Auto-Pilot Configuration")
+auto_pilot_interval = st.sidebar.slider("Auto-Pilot Check Interval (Minutes)", min_value=1, max_value=60, value=5)
+auto_pilot = st.sidebar.toggle("🤖 Enable Auto-Pilot Trading")
+
+if auto_pilot:
+    st_autorefresh(interval=auto_pilot_interval * 60 * 1000, key="auto_pilot_refresh")
+    st.sidebar.warning(f"Auto-Pilot is ACTIVE: The app will automatically scan and trade every {auto_pilot_interval} minutes.")
+    run_portfolio_execution()
 
 def get_plotly_layout():
     return dict(
@@ -230,7 +277,7 @@ if app_mode == "Research & Deploy":
                             with st.spinner("Forcing API Trade Execution..."):
                                 pt = PaperTrader(api_key, secret_key)
                                 # Force a Long signal (1) regardless of the model
-                                result = pt.execute_trade(ticker, 1) 
+                                result = pt.execute_trade(ticker, 1, active_models=active_models) 
                                 if "SUCCESS" in result:
                                     st.success(result)
                                 else:
@@ -299,7 +346,7 @@ elif app_mode == "Live Portfolio Tracking":
                     with man_col1:
                         if st.button("🟢 Force Market Buy", key=f"buy_{selected_ticker}"):
                             with st.spinner("Forcing API Trade Execution..."):
-                                res = pt.execute_trade(selected_ticker, 1)
+                                res = pt.execute_trade(selected_ticker, 1, active_models=active_models)
                                 if "SUCCESS" in res:
                                     st.success(res)
                                 else:
@@ -307,14 +354,14 @@ elif app_mode == "Live Portfolio Tracking":
                     with man_col2:
                         if st.button("🔴 Force Market Sell", key=f"sell_{selected_ticker}"):
                             with st.spinner("Forcing API Trade Execution..."):
-                                res = pt.execute_trade(selected_ticker, 0)
+                                res = pt.execute_trade(selected_ticker, 0, active_models=active_models)
                                 if "SUCCESS" in res:
                                     st.success(res)
                                 else:
                                     st.error(res)
                 
                 if st.button(f"🛑 Stop Tracking {selected_ticker}"):
-                    res = pt.execute_trade(selected_ticker, 0)
+                    res = pt.execute_trade(selected_ticker, 0, active_models=active_models)
                     pm.remove_ticker(selected_ticker)
                     st.success(f"{selected_ticker} removed. Liquidating position: {res}")
                     try:
