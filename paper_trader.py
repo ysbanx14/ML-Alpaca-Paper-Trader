@@ -1,7 +1,7 @@
 import os
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 
 class PaperTrader:
     def __init__(self, api_key: str, secret_key: str):
@@ -30,6 +30,11 @@ class PaperTrader:
             if signal == 1:
                 # We want to be Long
                 if current_position is None:
+                    # Check for pending open buy orders
+                    open_orders = self.trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol]))
+                    if open_orders:
+                        return f"SKIPPED: Pending buy order already exists for {symbol}."
+                        
                     # Not in position, so we buy
                     account = self.trading_client.get_account()
                     
@@ -72,12 +77,14 @@ class PaperTrader:
                             except Exception as qty_error:
                                 return f"ERROR executing trade (Notional failed: {str(notional_error)} | Qty fallback failed: {str(qty_error)})"
                     else:
-                        return f"SKIPPED: Insufficient buying power (${buying_power:.2f}) to execute trade."
+                        return f"SKIPPED: 1% of equity (${trade_amount:.2f}) is below the $10 minimum trade size."
                 else:
                     return f"SKIPPED: Already holding a Long position for {symbol}."
             
             elif signal == 0:
                 # We want to be Flat
+                open_orders = self.trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol]))
+                
                 if current_position is not None and float(current_position.qty) > 0:
                     try:
                         # We hold a position, liquidate it
@@ -87,6 +94,10 @@ class PaperTrader:
                         # Alpaca might queue it if market is closed, or reject it.
                         return f"API RESPONSE (Sell): {str(e)}"
                 else:
+                    if open_orders:
+                        for o in open_orders:
+                            self.trading_client.cancel_order_by_id(o.id)
+                        return f"SUCCESS: Cancelled pending orders for {symbol} to remain flat."
                     return f"SKIPPED: Already flat on {symbol}. No position to close."
             
             else:
